@@ -54,7 +54,6 @@ int main() {
         pthread_create(&tid, NULL, handle_request, &client_fd);
 
     }
-
     close(sockfd);
 }
 
@@ -66,10 +65,12 @@ void* handle_request(void* client_fd_addr) {
         //检查dns表
         //char* result = check_dns(buffer);
         strcpy(buffer, "mock result\0");
+        //todo 无法释放socket
         if (send(client_fd, buffer, strlen(buffer)+1, MSG_NOSIGNAL) == -1) {
             break;
         }
         free(buffer);
     }
     close(client_fd);
+    printf("connect has been closed");
 }
