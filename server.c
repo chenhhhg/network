@@ -6,78 +6,128 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <netdb.h>
+#include  <arpa/inet.h>
 #define SERVPORT 2333//定义端口号
 #define BACKLOG 10//请求队列中允许的最大请求数
-#define MAXDATASIZE 5//数据长度
+#define MAXDATASIZE 100//数据长度
+#define DEFAULT_SERVER_IP "127.0.0.53"
+#define MESSAGE_SIZE 1024 //DNS message size
+#define DNS_HOST 0x01
+#define DNS_CNAME 0x05
 
-//dns报文Header部分数据结构
-struct dns_header{
-    unsigned short id; //2字节（16位）
+//class define
+struct dns_item {
+	char *domain;
+	char *ip;
+};
+struct dns_header {
+
+    unsigned short id;
     unsigned short flags;
 
-    unsigned short questions; //问题数
-    unsigned short answer; //回答数
+    unsigned short questions;
+    unsigned short answer;
 
     unsigned short authority;
     unsigned short additional;
-};
 
-//dns报文Queries部分的数据结构
-struct dns_question{
-    int length; //主机名的长度，自己添加的，便于操作
+};
+struct dns_question {
+    int length;
     unsigned short qtype;
     unsigned short qclass;
-    //查询名是长度和域名组合
-    //如www.0voice.com ==> 60voice3com0
-    //之所以这么做是因为域名查询一般是树结构查询，com顶级域，0voice二级域
-    unsigned char *name; // 主机名（长度不确定）
+    unsigned char *name;
 };
 
-//dns响应报文中数据（域名和ip）的结构体
-struct dns_item{
-    char *domain;
-    char *ip;
-};
-
-
-
-void* handle_request(void* client_fd_addr);
+//method declare
+void handle_request(void* client_fd_addr);
+char* get_dns_result(char* buffer);
 int dns_create_header(struct dns_header *header);
-int dns_create_question(struct dns_question *question, const char *hostname);
-int dns_build_requestion(struct dns_header *header, struct dns_question *question, char *request, int rlen);
-int dns_client_commit(const char *domain);
+int dns_create_question(struct dns_question* question,const char* hostname);
+int dns_build_requestion(struct dns_header* header,struct dns_question* question,char* request,int rlen);
+int dns_client_commit(const char* domin, char* resp);
+void dns_parse_name(unsigned char *chunk, unsigned char *ptr, char *out, int *len);
+int dns_parse_response(char *buffer, struct dns_item **domains);
 
-int main() {
+//global varieble
+char* server_ip = NULL;
+int debug = 0;
+int ttl=64;
+
+int main(int argc,char *argv[]) {
     struct sockaddr_in server_sockaddr,client_sockaddr;//声明服务器和客户端的socket存储结构
-    int sin_size,recvbytes;
+    socklen_t sin_size;
     int sockfd,client_fd;//socket描述符
+    server_ip = calloc(30, sizeof(char));
 
+    char command_to_exc = 0;
+    for (int i=1;i<argc;i++) {
+        char *pchar = argv[i];
+        switch(pchar[0]){
+            case '-': {
+                switch (pchar[1]) {
+                    //single command
+                    case 'd': {
+                        debug=1;
+                        break;
+                    }
+                    default: {
+                        command_to_exc=pchar[1];
+                        break;
+                    }
+                }
+                break;
+            }
+            default: {
+                switch (command_to_exc) {
+                    //command with input
+                    case 'i': {
+                        strcpy(server_ip, pchar);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+        }
+    }
 
-    if((sockfd = socket(AF_INET,SOCK_STREAM,0)) == -1) {//建立socket链接
+    if (debug) {
+        printf("server_ip:%s\n",server_ip);
+    }
+
+    if((sockfd = socket(AF_INET,SOCK_STREAM,0)) == -1) {//get socket from Linux
         perror("Socket");
         exit(1);
     }
 
-    printf("Socket success!,sockfd=%d\n",sockfd);
+    if (debug) {
+    	printf("Socket success!,sockfd=%d\n",sockfd);
+    }
 
     //以sockaddt_in结构体填充socket信息
     server_sockaddr.sin_family = AF_INET;//IPv4
     server_sockaddr.sin_port = htons(SERVPORT);//端口
     server_sockaddr.sin_addr.s_addr = INADDR_ANY;//本主机的任意IP都可以使用
 
-    if((bind(sockfd,(struct sockaddr *)&server_sockaddr,sizeof(struct sockaddr))) == -1) {//bind函数绑定
+    if(bind(sockfd,(struct sockaddr *)&server_sockaddr,sizeof(struct sockaddr)) == -1) {//bind函数绑定
         perror("bind");
         exit(-1);
     }
 
-    printf("bind success!\n");
+    if (debug) {
+    	printf("bind success!\n");
+    }
 
     if(listen(sockfd,BACKLOG) == -1) {//监听
         perror("listen");
         exit(1);
     }
 
-    printf("listening ... \n");
+    if (debug) {
+    	printf("listening ... \n");
+    }
 
     while (1) {
         if((client_fd = accept(sockfd,(struct sockaddr *) &client_sockaddr,&sin_size)) == -1) {//等待客户端链接
@@ -85,22 +135,36 @@ int main() {
             exit(1);
         }
         printf("accept success!\n");
-        pthread_t tid; /* thread identifier */
-        /* create the thread */
+        pthread_t tid;
         pthread_create(&tid, NULL, handle_request, &client_fd);
-
+		if (debug) {
+			printf("thread %lu is handling connection %d\n",tid, client_fd);
+		}
     }
     close(sockfd);
 }
 
-void* handle_request(void* client_fd_addr) {
+void handle_request(void* client_fd_addr) {
     int client_fd = *(int *)client_fd_addr;
     while (1) {
         char* buffer = calloc(MAXDATASIZE, sizeof(char));
         recv(client_fd,buffer,MAXDATASIZE,0);
         //检查dns表
-        //char* result = check_dns(buffer);
-        strcpy(buffer, "mock result\0");
+        char* result = get_dns_result(buffer);
+        if(result == NULL) {
+        	char* response=NULL;
+            int res = dns_client_commit(buffer, response);
+        	if (res != 0) {
+				strcpy(buffer, "domain name dealing failed!");
+        		break;
+        	}
+        	//dns_parse_response(response, )
+        }else if (strcmp(result, "0.0.0.0") == 0) {
+            strcpy(buffer, "domain name not exist!");
+        }else {
+            strcpy(buffer, result);
+        }
+
         if (send(client_fd, buffer, strlen(buffer)+1, MSG_NOSIGNAL) == -1l) {
             break;
         }
@@ -110,153 +174,270 @@ void* handle_request(void* client_fd_addr) {
     printf("connect has been closed\n");
 }
 
-int dns_client_commit(const char *domain)
-{
-    //下方流程是基本定死的套路
-    //1.创建UDP socket
-    //网络层ipv4, 传输层用udp
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if(sockfd < 0)
-    {
-        return -1;
-    }
-
-    //2.结构体填充数据
-    struct sockaddr_in servaddr;
-    bzero(&servaddr, sizeof(servaddr)); //将结构体数组清空
-    servaddr.sin_family = AF_INET; 
-    servaddr.sin_port = htons(DNS_SERVER_PORT);
-    //点分十进制地址转为网络所用的二进制数 替换inet_pton
-    //servaddr.sin_addr.s_addr = inet_addr(DNS_SERVER_IP);
-    inet_pton(AF_INET, DNS_SERVER_IP, &servaddr.sin_addr.s_addr);
-
-    //UDP不一定要connect，只是这样提高成功发送请求的可能性
-    connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
-
-
-    //3.dns报文的数据填充
-    struct dns_header header = {0};
-    dns_create_header(&header);
-
-    struct dns_question question = {0};
-
-    dns_create_question(&question, domain);
-
-    char request[1024] = {0};
-    int len = dns_build_requestion(&header, &question, request, 1024);
-
-    //4.通过sockfd发送DNS请求报文
-    int slen = sendto(sockfd, request, len, 0, (struct sockaddr *)&servaddr, sizeof(struct sockaddr));
-
-    char response[1024] = {0};
-    struct sockaddr_in addr;
-    size_t addr_len = sizeof(struct sockaddr_in);
-
-    //5.接受DNS服务器的响应报文
-    //addr和addr_len是输出参数
-    int n = recvfrom(sockfd, response, sizeof(response), 0, (struct sockaddr *)&addr, (socklen_t *)&addr_len);
-
-    struct dns_item *dns_domain = NULL;
-    //6.解析响应
-    dns_parse_response(response, &dns_domain);
-
-    free(dns_domain);
-    
-    return n; //返回接受到的响应报文的长度
+char* get_dns_result(char* buffer) {
+    return "mock result";
 }
 
-//将header部分字段填充数据
-int dns_create_header(struct dns_header *header)
-{
-    if(header == NULL)
-        return -1;
-    memset(header, 0x00, sizeof(struct dns_header));
+int dns_create_header(struct dns_header *header) {
 
-    //id用随机数,种子用time(NULL),表明生成随机数的范围
-    srandom(time(NULL)); // 线程不安全
+    if (header == NULL) return -1;
+    memset(header, 0, sizeof(struct dns_header));
+
+    //random
+    srandom(time(NULL));
     header->id = random();
 
-    //网络字节序（大端）:地址低位存数据高位;主机字节序则与之相反
-    //主机(host)字节序转网络(net)字节序
-    header->flags = htons(0x0100);
-    header->questions = htons(1);
+    header->flags = htons(0x0100);//standard query
+    header->questions = htons(1);//only 1 name to query
+
     return 0;
 }
 
-int dns_create_question(struct dns_question *question, const char *hostname)
-{
-    if(question == NULL || hostname == NULL)
-        return -1;
-    memset(question, 0x00, sizeof(struct dns_question));
-
-    //内存空间长度：hostname长度 + 结尾\0 再多给一个空间
-    question->name = (char *)malloc(strlen(hostname) + 2);
-    if(question->name == NULL)
-    {
+int dns_create_question(struct dns_question* question,const char* hostname){
+    if(question==NULL||hostname==NULL) return -1;
+    memset(question,0,sizeof(question));
+    question->name=calloc(strlen(hostname)+2, sizeof(char));//head & end is to be inserted
+    if(question->name==NULL){//如果内存分配失败
         return -2;
     }
+    question->length=strlen(hostname)+2;
+    question->qtype=htons(1);//to get IPv4 address
+    question->qclass=htons(1);//Internet data
 
-    question->length = strlen(hostname) + 2;
+    char* qname=question->name;
+    char* hostname_dup=strdup(hostname);
+	strcpy(hostname + strlen(hostname), ".\0");//just to adapt to the algorythm we used
 
-    //查询类型1表示获得IPv4地址
-    question->qtype = htons(1);
-    //查询类1表示Internet数据
-    question->qclass = htons(1);
-
-    //【重要步骤】
-    //名字存储：www.0voice.com -> 3www60voice3com
-    const char delim[2] = ".";
-    char *qname = question->name; //用于填充内容用的指针
-
-    //strdup先开辟大小与hostname同的内存，然后将hostname的字符拷贝到开辟的内存上
-    char *hostname_dup = strdup(hostname); //复制字符串，调用malloc
-    //将按照delim分割出字符串数组，返回第一个字符串
-    char *token = strtok(hostname_dup, delim);
-
-    while(token != NULL)
-    {
-        //strlen返回字符串长度不含'\0'
-        size_t len = strlen(token);
-
-        *qname = len;//长度的ASCII码
-        qname++;
-
-        //将token所指的字符串复制到qname所指的内存上，最多复制len + 1长度
-        //len+1使得最后一个字符串把\0复制进去
-        strncpy(qname, token, len + 1);
-        qname += len;
-
-        //固定写法，此时内部会获得下一个分割出的字符串返回（strtok会依赖上一次运行的结果）
-        token = strtok(NULL, delim); //依赖上一次的结果，线程不安全
-    }
+	int l=0,r=0;
+	unsigned char len = 0;
+	for (r=0; r<strlen(hostname); ++r) {
+		switch (hostname[r]) {
+			//handle last token
+			case '.': {
+				*qname = len;
+				qname++;
+				//last token
+				char* sub = calloc(64, sizeof(char));
+				strncpy(sub, hostname+l, len);
+				strcpy(qname, sub);
+				qname += len;
+				len=0;
+				//after "."
+				l = r+1;
+				free(sub);
+				break;
+			}
+			default: {
+				len++;
+			}
+		}
+	}
 
     free(hostname_dup);
+	return 0;
 }
 
-//将header和question合并到request中
-//header [in]
-//question [in]
-//request [out]
-//rlen:代表request的大小
-int dns_build_requestion(struct dns_header *header, struct dns_question *question, char *request, int rlen){
-    if (header == NULL || question == NULL || request == NULL)
+int dns_build_requestion(struct dns_header* header,struct dns_question* question,char* request,int rlen){
+    if(header==NULL||question==NULL||request==NULL) return -1;
+    memset(request,0,rlen);
+
+    //header-->request
+    memcpy(request,header,sizeof(struct dns_header));//把header的数据 拷贝 到request中
+    int offset=sizeof(struct dns_header);
+
+    //question-->request
+    memcpy(request+offset,question->name,question->length);//QNAME is not aligned
+    offset+=question->length;
+    memcpy(request+offset,&question->qtype,sizeof(question->qtype));
+    offset+=sizeof(question->qtype);
+    memcpy(request+offset,&question->qclass,sizeof(question->qclass));
+    offset+=sizeof(question->qclass);
+    return offset;
+}
+
+int dns_client_commit(const char* domin, char* resp){
+    struct hostent* host;
+    struct sockaddr_in serv_addr;
+    int sockfd=socket(AF_INET,SOCK_DGRAM,0);//pv4, udp;
+
+    if(sockfd<0){//创建失败
         return -1;
+    }
 
-    memset(request, 0, rlen);
+    if((host = gethostbyname(server_ip)) == NULL) {//转换为hostent
+        perror("gethostbyname");
+        exit(1);
+    }
 
-    //header -> request
-    memcpy(request, header, sizeof(struct dns_header));
-    int offset = sizeof(struct dns_header);
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(SERVPORT);
+    serv_addr.sin_addr = *((struct in_addr *)host->h_addr);
+    bzero(&(serv_addr.sin_zero),8);
 
-    //Queries部分字段写入到request中，question->length是question->name的长度
-    memcpy(request + offset, question->name, question->length);
-    offset += question->length;
+    if((connect(sockfd,(struct sockaddr *)&serv_addr,sizeof(struct sockaddr))) == -1) {//发起对服务器的链接
+        perror("connect");
+        exit(1);
+    }
 
-    memcpy(request + offset, &question->qclass, sizeof(question->qclass));
-    offset += sizeof(question->qclass);
+    struct dns_header header={0};
+    dns_create_header(&header);
+    struct dns_question question={0};
+    dns_create_question(&question,domin);
 
-    memcpy(request + offset, &question->qtype, sizeof(question->qtype));
-    offset += sizeof(question->qtype);
+    char* request=calloc(MESSAGE_SIZE, sizeof(char));//假设定义为1024长度
+    int length = dns_build_requestion(&header,&question,request,MESSAGE_SIZE);
+    char* response = calloc(MESSAGE_SIZE, sizeof(char));
 
-    return offset; //返回request数据的实际长度
+	if (setsockopt(sockfd, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) < 0) {
+		perror("setsockopt failed");
+		return -2;
+	}
+
+    send(sockfd, request, length, 0);
+    recv(sockfd,response,MESSAGE_SIZE,0);
+
+    if(debug) {
+        for(int i=0;i<MESSAGE_SIZE;i++){
+            printf("%c",response[i]);
+        }
+        for(int i=0;i<MESSAGE_SIZE;i++){
+            printf("%x",response[i]);
+        }
+        printf("\n");
+    }
+	free(request);
+	resp = response;
+    return 0;
 }
+
+int is_pointer(int in) {
+	return (in & 0xC0) == 0xC0;
+}
+
+
+void dns_parse_name(unsigned char *chunk, unsigned char *ptr, char *out, int *len) {
+
+	int flag = 0, n = 0, alen = 0;
+	char *pos = out + (*len);
+
+	while (1) {
+
+		flag = (int)ptr[0];
+		if (flag == 0) break;
+
+		if (is_pointer(flag)) {
+
+			n = (int)ptr[1];
+			ptr = chunk + n;
+			dns_parse_name(chunk, ptr, out, len);
+			break;
+
+		} else {
+
+			ptr ++;
+			memcpy(pos, ptr, flag);
+			pos += flag;
+			ptr += flag;
+
+			*len += flag;
+			if ((int)ptr[0] != 0) {
+				memcpy(pos, ".", 1);
+				pos += 1;
+				(*len) += 1;
+			}
+		}
+
+	}
+
+}
+
+int dns_parse_response(char *buffer, struct dns_item **domains) {
+
+	int i = 0;
+	unsigned char *ptr = (unsigned char* )buffer;
+
+	ptr += 4;
+	int querys = ntohs(*(unsigned short*)ptr);
+
+	ptr += 2;
+	int answers = ntohs(*(unsigned short*)ptr);
+
+	ptr += 6;
+	for (i = 0;i < querys;i ++) {
+		while (1) {
+			int flag = (int)ptr[0];
+			ptr += (flag + 1);
+
+			if (flag == 0) break;
+		}
+		ptr += 4;
+	}
+
+	char cname[128], aname[128], ip[20], netip[4];
+	int len, type, ttl, datalen;
+
+	int cnt = 0;
+	struct dns_item *list = (struct dns_item*)calloc(answers, sizeof(struct dns_item));
+	if (list == NULL) {
+		return -1;
+	}
+
+	for (i = 0;i < answers;i ++) {
+
+		bzero(aname, sizeof(aname));
+		len = 0;
+
+		dns_parse_name((unsigned char* )buffer, ptr, aname, &len);
+		ptr += 2;
+
+		type = htons(*(unsigned short*)ptr);
+		ptr += 4;
+
+		ttl = htons(*(unsigned short*)ptr);
+		ptr += 4;
+
+		datalen = ntohs(*(unsigned short*)ptr);
+		ptr += 2;
+
+		if (type == DNS_CNAME) {
+
+			bzero(cname, sizeof(cname));
+			len = 0;
+			dns_parse_name((unsigned char* )buffer, ptr, cname, &len);
+			ptr += datalen;
+
+		} else if (type == DNS_HOST) {
+
+			bzero(ip, sizeof(ip));
+
+			if (datalen == 4) {
+				memcpy(netip, ptr, datalen);
+				inet_ntop(AF_INET , netip , ip , sizeof(struct sockaddr));
+
+				printf("%s has address %s\n" , aname, ip);
+				printf("\tTime to live: %d minutes , %d seconds\n", ttl / 60, ttl % 60);
+
+				list[cnt].domain = (char *)calloc(strlen(aname) + 1, 1);
+				memcpy(list[cnt].domain, aname, strlen(aname));
+
+				list[cnt].ip = (char *)calloc(strlen(ip) + 1, 1);
+				memcpy(list[cnt].ip, ip, strlen(ip));
+
+				cnt ++;
+			}
+
+			ptr += datalen;
+		}
+	}
+
+	*domains = list;
+	ptr += 2;
+
+	return cnt;
+
+}
+
+
+
+
+
