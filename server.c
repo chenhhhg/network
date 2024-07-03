@@ -13,8 +13,8 @@
 #define MAXDATASIZE 100//数据长度
 #define DEFAULT_SERVER_IP "127.0.0.53"
 #define MESSAGE_SIZE 1024 //DNS message size
-#define DNS_HOST 0x01
-#define DNS_CNAME 0x05
+#define DNS_IP 0x01
+#define BUCKET_SIZE 1<<15//size of our map
 
 //class define
 struct dns_item {
@@ -39,6 +39,11 @@ struct dns_question {
     unsigned short qclass;
     unsigned char *name;
 };
+struct entry {
+	char domain_name[255];
+	char ip[16];
+	struct entry* next;
+};
 
 //method declare
 void handle_request(void* client_fd_addr);
@@ -47,20 +52,25 @@ int dns_create_header(struct dns_header *header);
 int dns_create_question(struct dns_question* question,const char* hostname);
 int dns_build_requestion(struct dns_header* header,struct dns_question* question,char* request,int rlen);
 int dns_client_commit(const char* domin, char* resp);
-void dns_parse_name(unsigned char *chunk, unsigned char *ptr, char *out, int *len);
-int dns_parse_response(char *buffer, struct dns_item **domains);
+void dns_parse_name(unsigned char *ptr, char *out);
+int dns_parse_response(char *buffer);
+char* get(char* domain_name);
+int put(char* domain_name, char* ip);
 
 //global varieble
 char* server_ip = NULL;
 int debug = 0;
 int ttl=64;
-
+struct entry* map = NULL;
 int main(int argc,char *argv[]) {
     struct sockaddr_in server_sockaddr,client_sockaddr;//声明服务器和客户端的socket存储结构
     socklen_t sin_size;
     int sockfd,client_fd;//socket描述符
     server_ip = calloc(30, sizeof(char));
+	strcpy(server_ip, DEFAULT_SERVER_IP);
+	map = calloc(BUCKET_SIZE, sizeof(struct entry));
 
+	//execute command
     char command_to_exc = 0;
     for (int i=1;i<argc;i++) {
         char *pchar = argv[i];
@@ -150,15 +160,18 @@ void handle_request(void* client_fd_addr) {
         char* buffer = calloc(MAXDATASIZE, sizeof(char));
         recv(client_fd,buffer,MAXDATASIZE,0);
         //检查dns表
-        char* result = get_dns_result(buffer);
+        char* result = get(buffer);
         if(result == NULL) {
+        	if (debug) {
+        		printf("failed to find ip in map, sending to server\n");
+        	}
         	char* response=NULL;
             int res = dns_client_commit(buffer, response);
         	if (res != 0) {
 				strcpy(buffer, "domain name dealing failed!");
         		break;
         	}
-        	//dns_parse_response(response, )
+        	dns_parse_response(response);
         }else if (strcmp(result, "0.0.0.0") == 0) {
             strcpy(buffer, "domain name not exist!");
         }else {
@@ -178,8 +191,74 @@ char* get_dns_result(char* buffer) {
     return "mock result";
 }
 
-int dns_create_header(struct dns_header *header) {
+unsigned hash(char* str) {
+	int n = strlen(str);
+	unsigned int hashValue = 0;
 
+	for (int i = 0; i < n; i++) {
+		hashValue = hashValue * 31 + str[i];
+	}
+
+	return hashValue;
+}
+
+char* get(char* domain_name) {
+	if (domain_name == NULL) {
+		if (debug) {
+			printf("null pointer exception in get!\n");
+		}
+		return -1;
+	}
+	unsigned index = hash(domain_name) & (BUCKET_SIZE-1);
+	if (strlen(map[index].ip)==0) {
+		return NULL;
+	}
+	struct entry* e = &map[index];
+	while (e!=NULL && strcmp(e->domain_name, domain_name)!=0) {
+		e = e->next;
+	}
+	return e==NULL?NULL : e->ip;
+
+}
+int put(char* domain_name, char* ip) {
+	if (domain_name == NULL || ip==NULL) {
+		if (debug) {
+			printf("null pointer exception in put!");
+		}
+		return -1;
+	}
+	unsigned index = hash(domain_name) & (BUCKET_SIZE-1);
+	//empty bucket
+	if (strlen(map[index].ip)==0) {
+		struct entry* e = calloc(1, sizeof(struct entry));
+		strcpy(e->domain_name, domain_name);
+		strcpy(e->ip, ip);
+		map[index] = *e;
+		free(e);
+		return 0;
+	}
+	struct entry* e = &map[index], *pre=e;
+	//find end or cover
+	while (e!=NULL && strcmp(e->domain_name, domain_name)!=0) {
+		pre = e;
+		e = e->next;
+	}
+	struct entry* cur;
+	if (e==NULL) {
+		cur = pre->next=calloc(1, sizeof(struct entry));
+	}else {
+		cur = e;
+	}
+	strcpy(cur->domain_name, domain_name);
+	strcpy(cur->ip, ip);
+	return 0;
+}
+
+
+int dns_create_header(struct dns_header *header) {
+	if (debug) {
+		printf("dns_create_header begin!\n");
+	}
     if (header == NULL) return -1;
     memset(header, 0, sizeof(struct dns_header));
 
@@ -189,11 +268,16 @@ int dns_create_header(struct dns_header *header) {
 
     header->flags = htons(0x0100);//standard query
     header->questions = htons(1);//only 1 name to query
-
+	if (debug) {
+		printf("dns_create_header end!\n");
+	}
     return 0;
 }
 
 int dns_create_question(struct dns_question* question,const char* hostname){
+	if (debug) {
+		printf("dns_create_question begin!\n");
+	}
     if(question==NULL||hostname==NULL) return -1;
     memset(question,0,sizeof(question));
     question->name=calloc(strlen(hostname)+2, sizeof(char));//head & end is to be inserted
@@ -234,10 +318,16 @@ int dns_create_question(struct dns_question* question,const char* hostname){
 	}
 
     free(hostname_dup);
+	if (debug) {
+		printf("dns_create_question end!\n");
+	}
 	return 0;
 }
 
 int dns_build_requestion(struct dns_header* header,struct dns_question* question,char* request,int rlen){
+	if (debug) {
+		printf("dns_build_requestion begin!\n");
+	}
     if(header==NULL||question==NULL||request==NULL) return -1;
     memset(request,0,rlen);
 
@@ -252,10 +342,16 @@ int dns_build_requestion(struct dns_header* header,struct dns_question* question
     offset+=sizeof(question->qtype);
     memcpy(request+offset,&question->qclass,sizeof(question->qclass));
     offset+=sizeof(question->qclass);
+	if (debug) {
+		printf("dns_build_requestion end!\n");
+	}
     return offset;
 }
 
 int dns_client_commit(const char* domin, char* resp){
+	if (debug) {
+		printf("dns_client_commit begin!\n");
+	}
     struct hostent* host;
     struct sockaddr_in serv_addr;
     int sockfd=socket(AF_INET,SOCK_DGRAM,0);//pv4, udp;
@@ -264,19 +360,17 @@ int dns_client_commit(const char* domin, char* resp){
         return -1;
     }
 
-    if((host = gethostbyname(server_ip)) == NULL) {//转换为hostent
-        perror("gethostbyname");
-        exit(1);
-    }
-
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(SERVPORT);
-    serv_addr.sin_addr = *((struct in_addr *)host->h_addr);
+	if (inet_pton(AF_INET, server_ip, &(serv_addr.sin_addr)) != 1) {
+		perror("setting ip");
+		return -2;
+	}
     bzero(&(serv_addr.sin_zero),8);
 
     if((connect(sockfd,(struct sockaddr *)&serv_addr,sizeof(struct sockaddr))) == -1) {//发起对服务器的链接
         perror("connect");
-        exit(1);
+    	return -3;
     }
 
     struct dns_header header={0};
@@ -289,14 +383,15 @@ int dns_client_commit(const char* domin, char* resp){
     char* response = calloc(MESSAGE_SIZE, sizeof(char));
 
 	if (setsockopt(sockfd, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) < 0) {
-		perror("setsockopt failed");
-		return -2;
+		perror("setsockopt-ttl failed");
+		return -4;
 	}
 
-    send(sockfd, request, length, 0);
-    recv(sockfd,response,MESSAGE_SIZE,0);
+    int res = send(sockfd, request, length, MSG_NOSIGNAL);
+    recv(sockfd,response,MESSAGE_SIZE,MSG_NOSIGNAL);
+	strcpy(resp, response);
 
-    if(debug) {
+	if(debug) {
         for(int i=0;i<MESSAGE_SIZE;i++){
             printf("%c",response[i]);
         }
@@ -305,9 +400,9 @@ int dns_client_commit(const char* domin, char* resp){
         }
         printf("\n");
     }
+
 	free(request);
-	resp = response;
-    return 0;
+    return -res;
 }
 
 int is_pointer(int in) {
@@ -315,43 +410,16 @@ int is_pointer(int in) {
 }
 
 
-void dns_parse_name(unsigned char *chunk, unsigned char *ptr, char *out, int *len) {
+void dns_parse_name(unsigned char *ptr, char *out) {
 
-	int flag = 0, n = 0, alen = 0;
-	char *pos = out + (*len);
-
-	while (1) {
-
-		flag = (int)ptr[0];
-		if (flag == 0) break;
-
-		if (is_pointer(flag)) {
-
-			n = (int)ptr[1];
-			ptr = chunk + n;
-			dns_parse_name(chunk, ptr, out, len);
-			break;
-
-		} else {
-
-			ptr ++;
-			memcpy(pos, ptr, flag);
-			pos += flag;
-			ptr += flag;
-
-			*len += flag;
-			if ((int)ptr[0] != 0) {
-				memcpy(pos, ".", 1);
-				pos += 1;
-				(*len) += 1;
-			}
-		}
-
+	int i=0, len=0;
+	while ((len=ptr[i])!=0) {
+		strncpy(out+i, &ptr[i+1], len);
+		i += (len+1);
 	}
-
 }
 
-int dns_parse_response(char *buffer, struct dns_item **domains) {
+int dns_parse_response(char *buffer) {
 
 	int i = 0;
 	unsigned char *ptr = (unsigned char* )buffer;
@@ -362,10 +430,12 @@ int dns_parse_response(char *buffer, struct dns_item **domains) {
 	ptr += 2;
 	int answers = ntohs(*(unsigned short*)ptr);
 
+	//questions
 	ptr += 6;
 	for (i = 0;i < querys;i ++) {
 		while (1) {
-			int flag = (int)ptr[0];
+			//3www5baidu3com0
+			int flag = ptr[0];
 			ptr += (flag + 1);
 
 			if (flag == 0) break;
@@ -373,11 +443,12 @@ int dns_parse_response(char *buffer, struct dns_item **domains) {
 		ptr += 4;
 	}
 
-	char cname[128], aname[128], ip[20], netip[4];
-	int len, type, ttl, datalen;
+	//answers
+	char aname[128], ip[20], netip[4];
+	int type, datalen;
 
 	int cnt = 0;
-	struct dns_item *list = (struct dns_item*)calloc(answers, sizeof(struct dns_item));
+	struct dns_item *list = calloc(answers, sizeof(struct dns_item));
 	if (list == NULL) {
 		return -1;
 	}
@@ -385,56 +456,29 @@ int dns_parse_response(char *buffer, struct dns_item **domains) {
 	for (i = 0;i < answers;i ++) {
 
 		bzero(aname, sizeof(aname));
-		len = 0;
 
-		dns_parse_name((unsigned char* )buffer, ptr, aname, &len);
-		ptr += 2;
+		dns_parse_name(ptr, aname);
+		ptr += (strlen(ptr)+1);
 
 		type = htons(*(unsigned short*)ptr);
-		ptr += 4;
-
-		ttl = htons(*(unsigned short*)ptr);
-		ptr += 4;
+		ptr += 8;
 
 		datalen = ntohs(*(unsigned short*)ptr);
 		ptr += 2;
 
-		if (type == DNS_CNAME) {
-
-			bzero(cname, sizeof(cname));
-			len = 0;
-			dns_parse_name((unsigned char* )buffer, ptr, cname, &len);
-			ptr += datalen;
-
-		} else if (type == DNS_HOST) {
-
-			bzero(ip, sizeof(ip));
-
-			if (datalen == 4) {
-				memcpy(netip, ptr, datalen);
-				inet_ntop(AF_INET , netip , ip , sizeof(struct sockaddr));
-
-				printf("%s has address %s\n" , aname, ip);
-				printf("\tTime to live: %d minutes , %d seconds\n", ttl / 60, ttl % 60);
-
-				list[cnt].domain = (char *)calloc(strlen(aname) + 1, 1);
-				memcpy(list[cnt].domain, aname, strlen(aname));
-
-				list[cnt].ip = (char *)calloc(strlen(ip) + 1, 1);
-				memcpy(list[cnt].ip, ip, strlen(ip));
-
-				cnt ++;
-			}
-
-			ptr += datalen;
+		//we only accept IPv4
+		if(type!=DNS_IP || datalen!=4) {
+			continue;
 		}
+
+		memcpy(netip, ptr, datalen);
+		inet_ntop(AF_INET , netip , ip , sizeof(struct sockaddr));
+
+		put(buffer, ip);
+
+		++cnt;
 	}
-
-	*domains = list;
-	ptr += 2;
-
 	return cnt;
-
 }
 
 
