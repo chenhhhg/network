@@ -209,9 +209,17 @@ void handle_request(void* client_fd_addr) {
             int res = dns_client_commit(buffer, response);
         	if (res != 0) {
 				strcpy(buffer, "domain name dealing failed!");
-        		break;
         	}
         	dns_parse_response(response);
+        	if(debug) {
+        		for(int i=0;i<MESSAGE_SIZE;i++){
+        			printf("%c",response[i]);
+        		}
+        		for(int i=0;i<MESSAGE_SIZE;i++){
+        			printf("%x",response[i]);
+        		}
+        		printf("\n");
+        	}
         }else if (strcmp(result, "0.0.0.0") == 0) {
             strcpy(buffer, "Bad domain name! Do not access!");
         }else {
@@ -383,6 +391,10 @@ int dns_build_requestion(struct dns_header* header,struct dns_question* question
     memcpy(request+offset,&question->qclass,sizeof(question->qclass));
     offset+=sizeof(question->qclass);
 	if (debug) {
+		printf("dns request\n");
+		for(int i=0;i<30;i++){
+			printf("%x",request[i]);
+		}
 		printf("dns_build_requestion end!\n");
 	}
     return offset;
@@ -430,25 +442,9 @@ int dns_client_commit(const char* domin, char* resp){
     int res = send(sockfd, request, length, MSG_NOSIGNAL);
     recv(sockfd,response,MESSAGE_SIZE,MSG_NOSIGNAL);
 	strcpy(resp, response);
-
-	if(debug) {
-        for(int i=0;i<MESSAGE_SIZE;i++){
-            printf("%c",response[i]);
-        }
-        for(int i=0;i<MESSAGE_SIZE;i++){
-            printf("%x",response[i]);
-        }
-        printf("\n");
-    }
-
 	free(request);
     return -res;
 }
-
-int is_pointer(int in) {
-	return (in & 0xC0) == 0xC0;
-}
-
 
 void dns_parse_name(unsigned char *ptr, char *out) {
 
