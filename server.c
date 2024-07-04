@@ -15,7 +15,7 @@
 #define MESSAGE_SIZE 1024 //DNS message size
 #define DNS_IP 0x01
 #define BUCKET_SIZE 1<<15//size of our map
-
+#define DEFAULT_FILENAME "dnsrelay.txt"
 //class define
 struct dns_item {
 	char *domain;
@@ -61,13 +61,16 @@ int put(char* domain_name, char* ip);
 char* server_ip = NULL;
 int debug = 0;
 int ttl=64;
+char* filename=NULL;
 struct entry* map = NULL;
 int main(int argc,char *argv[]) {
     struct sockaddr_in server_sockaddr,client_sockaddr;//声明服务器和客户端的socket存储结构
     socklen_t sin_size;
     int sockfd,client_fd;//socket描述符
     server_ip = calloc(30, sizeof(char));
+	filename=calloc(100, sizeof(char));
 	strcpy(server_ip, DEFAULT_SERVER_IP);
+	strcpy(filename, DEFAULT_FILENAME);
 	map = calloc(BUCKET_SIZE, sizeof(struct entry));
 
 	//execute command
@@ -96,6 +99,10 @@ int main(int argc,char *argv[]) {
                         strcpy(server_ip, pchar);
                         break;
                     }
+                	case 'f':{
+						strcpy(filename, pchar);
+                    	break;
+                	}
                     default:
                         break;
                 }
@@ -139,6 +146,39 @@ int main(int argc,char *argv[]) {
     	printf("listening ... \n");
     }
 
+	if(debug) {
+		printf("reading file\n");
+	}
+
+
+	FILE* file = fopen(filename, "r");
+	if (file == NULL) {
+		perror("Error opening file");
+		exit(1);
+	}
+
+	char* ip=calloc(16, sizeof(char));
+	char* domain=calloc(255, sizeof(char));
+
+	int f=fscanf(file, "%s %s", ip, domain);
+	while (f!=EOF && f == 2) {
+        put(domain, ip);
+		if (debug) {
+			printf("use domain %s get from map:%s\n",domain,get(domain));
+		}
+		bzero(ip, 16);
+		bzero(domain,255);
+		f=fscanf(file, "%s %s", ip, domain);
+	}
+
+	fclose(file);
+	free(filename);
+	free(ip);
+	free(domain);
+
+	if (debug) {
+		printf("start working\n");
+	}
     while (1) {
         if((client_fd = accept(sockfd,(struct sockaddr *) &client_sockaddr,&sin_size)) == -1) {//等待客户端链接
             perror("accept");
@@ -165,7 +205,7 @@ void handle_request(void* client_fd_addr) {
         	if (debug) {
         		printf("failed to find ip in map, sending to server\n");
         	}
-        	char* response=NULL;
+        	char* response=calloc(MESSAGE_SIZE, sizeof(char));
             int res = dns_client_commit(buffer, response);
         	if (res != 0) {
 				strcpy(buffer, "domain name dealing failed!");
@@ -173,7 +213,7 @@ void handle_request(void* client_fd_addr) {
         	}
         	dns_parse_response(response);
         }else if (strcmp(result, "0.0.0.0") == 0) {
-            strcpy(buffer, "domain name not exist!");
+            strcpy(buffer, "Bad domain name! Do not access!");
         }else {
             strcpy(buffer, result);
         }
